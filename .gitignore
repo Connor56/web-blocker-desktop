@@ -1,0 +1,5 @@
+/annoying-web-blocker-desktop
+/annoying-web-blocker-desktop-*
+*.exe
+*.test
+/dist/
