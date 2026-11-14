@@ -16,6 +16,7 @@ import (
 	"annoying-web-blocker-desktop/internal/config"
 	"annoying-web-blocker-desktop/internal/hosts"
 	"annoying-web-blocker-desktop/internal/web"
+
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
@@ -126,11 +127,7 @@ func InstallRoot(source, home string, _, _ int) error {
 	if err := setACL(SystemTokenPath, false); err != nil {
 		return err
 	}
-	if _, err := os.Stat(config.DefaultPath); errors.Is(err, os.ErrNotExist) {
-		if err := config.Save(config.DefaultPath, config.Default()); err != nil {
-			return err
-		}
-	} else if err != nil {
+	if err := config.Initialize(config.DefaultPath); err != nil {
 		return err
 	}
 	client := clientTokenPath(home)
@@ -232,7 +229,14 @@ func UninstallRoot() error {
 		}
 	}
 	// Remove only known installation files, leaving any unrelated directory contents alone.
-	for _, path := range []string{SystemTokenPath, config.DefaultPath, BinaryPath} {
+	for _, path := range []string{
+		SystemTokenPath,
+		config.DefaultPath,
+		config.DefaultPath + ".bak",
+		config.DefaultPath + ".key",
+		config.LegacyPath,
+		BinaryPath,
+	} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove %s (run uninstall from your original downloaded executable): %w", path, err)
 		}

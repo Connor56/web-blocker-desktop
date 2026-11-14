@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -46,16 +47,16 @@ func TestAPISavesValidatedConfigAndCallsOnChange(t *testing.T) {
 			return nil
 		},
 	}.Routes()
-	body := `{"enabled":true,"start":"09:00","end":"17:00","domains":["Example.com"]}`
+	body := `{"sites":[{"domain":"Example.com","enabled":true,"schedules":[{"start":"09:00","end":"17:00"}]}]}`
 	recorder := request(t, h, http.MethodPut, "/api/config", "secret", body)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("got status %d: %s", recorder.Code, recorder.Body.String())
 	}
-	if len(changed.Domains) != 1 || changed.Domains[0] != "example.com" {
+	if len(changed.Sites) != 1 || changed.Sites[0].Domain != "example.com" {
 		t.Fatalf("unexpected callback config: %#v", changed)
 	}
 	loaded, err := config.Load(path)
-	if err != nil || len(loaded.Domains) != 1 || loaded.Domains[0] != "example.com" {
+	if err != nil || len(loaded.Sites) != 1 || loaded.Sites[0].Domain != "example.com" {
 		t.Fatalf("unexpected saved config: %#v, %v", loaded, err)
 	}
 }
@@ -75,7 +76,7 @@ func TestAPIRejectsInvalidOriginAndDomain(t *testing.T) {
 		t.Fatalf("invalid origin got status %d", recorder.Code)
 	}
 
-	body := `{"enabled":true,"start":"09:00","end":"17:00","domains":["https://example.com"]}`
+	body := `{"sites":[{"domain":"https://example.com","enabled":true,"schedules":[{"start":"09:00","end":"17:00"}]}]}`
 	if got := request(t, handler, http.MethodPut, "/api/config", "secret", body).Code; got != http.StatusBadRequest {
 		t.Fatalf("invalid domain got status %d", got)
 	}
@@ -89,5 +90,65 @@ func TestRejectsDNSRebindingHost(t *testing.T) {
 	handler.ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("got status %d", recorder.Code)
+	}
+}
+
+func TestWeakeningRequiresAndConsumesChallenge(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	strong := config.Config{Sites: []config.Site{{
+		Domain: "example.com", Enabled: true,
+		Schedules: []config.Schedule{{Start: "09:00", End: "17:00"}},
+	}}}
+	if err := config.Save(path, strong); err != nil {
+		t.Fatal(err)
+	}
+	handler := Handler{
+		Token: "secret", ConfigPath: path,
+		ChallengeDuration: 10 * time.Millisecond, ClickInterval: time.Second,
+	}.Routes()
+	weaker := `{"sites":[{"domain":"example.com","enabled":true,"schedules":[{"start":"10:00","end":"17:00"}]}]}`
+	if got := request(t, handler, http.MethodPut, "/api/config", "secret", weaker).Code; got != http.StatusLocked {
+		t.Fatalf("weakening without challenge got %d", got)
+	}
+
+	start := request(t, handler, http.MethodPost, "/api/unlock/start", "secret", `{}`)
+	if start.Code != http.StatusOK {
+		t.Fatalf("start challenge: %d %s", start.Code, start.Body.String())
+	}
+	var challenge struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(start.Body.Bytes(), &challenge); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(15 * time.Millisecond)
+	click := request(t, handler, http.MethodPost, "/api/unlock/click", "secret", `{"id":"`+challenge.ID+`"}`)
+	var unlocked struct {
+		Token string `json:"unlockToken"`
+	}
+	if err := json.Unmarshal(click.Body.Bytes(), &unlocked); err != nil || unlocked.Token == "" {
+		t.Fatalf("complete challenge: %d %s (%v)", click.Code, click.Body.String(), err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/config", strings.NewReader(weaker))
+	req.Host = Address
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Origin", BaseURL)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Change-Unlock", unlocked.Token)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("save after challenge: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if got := request(t, handler, http.MethodPut, "/api/config", "secret", `{"sites":[]}`).Code; got != http.StatusLocked {
+		t.Fatalf("unlock token was reusable, got %d", got)
+	}
+}
+
+func TestDefaultChallengeRequiresTwoMinutesAndFiveSecondClicks(t *testing.T) {
+	duration, interval := (Handler{}).challengeSettings()
+	if duration != 120*time.Second || interval != 5*time.Second {
+		t.Fatalf("got duration %v and interval %v", duration, interval)
 	}
 }

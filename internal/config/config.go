@@ -1,62 +1,78 @@
 package config
 
 import (
-	"annoying-web-blocker-desktop/internal/platformpaths"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
 )
 
-var DefaultPath = filepath.Join(platformpaths.ApplicationDir, "config.json")
-
 var labelPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 
 type Config struct {
-	Enabled bool     `json:"enabled"`
-	Start   string   `json:"start"`
-	End     string   `json:"end"`
-	Domains []string `json:"domains"`
+	Sites []Site `json:"sites"`
+}
+
+type Site struct {
+	Domain    string     `json:"domain"`
+	Enabled   bool       `json:"enabled"`
+	Schedules []Schedule `json:"schedules"`
+}
+
+type Schedule struct {
+	Start string `json:"start"`
+	End   string `json:"end"`
 }
 
 func Default() Config {
-	return Config{Start: "09:00", End: "17:00", Domains: []string{}}
+	return Config{Sites: []Site{}}
 }
 
 func (c Config) Validate() (Config, error) {
-	start, err := parseClock(c.Start)
-	if err != nil {
-		return Config{}, fmt.Errorf("start time: %w", err)
-	}
-	end, err := parseClock(c.End)
-	if err != nil {
-		return Config{}, fmt.Errorf("end time: %w", err)
-	}
-	if start == end {
-		return Config{}, errors.New("start and end times must be different")
-	}
-
-	seen := make(map[string]struct{}, len(c.Domains))
-	domains := make([]string, 0, len(c.Domains))
-	for _, raw := range c.Domains {
-		domain, err := NormalizeDomain(raw)
+	seen := make(map[string]struct{}, len(c.Sites))
+	sites := make([]Site, 0, len(c.Sites))
+	for _, site := range c.Sites {
+		domain, err := NormalizeDomain(site.Domain)
 		if err != nil {
 			return Config{}, err
 		}
-		if _, ok := seen[domain]; !ok {
-			seen[domain] = struct{}{}
-			domains = append(domains, domain)
+		if _, ok := seen[domain]; ok {
+			return Config{}, fmt.Errorf("duplicate domain %q", domain)
 		}
+		seen[domain] = struct{}{}
+		schedules := make([]Schedule, 0, len(site.Schedules))
+		scheduleSeen := make(map[Schedule]struct{}, len(site.Schedules))
+		for _, schedule := range site.Schedules {
+			start, err := parseClock(schedule.Start)
+			if err != nil {
+				return Config{}, fmt.Errorf("%s start time: %w", domain, err)
+			}
+			end, err := parseClock(schedule.End)
+			if err != nil {
+				return Config{}, fmt.Errorf("%s end time: %w", domain, err)
+			}
+			if start == end {
+				return Config{}, fmt.Errorf("%s start and end times must be different", domain)
+			}
+			if _, ok := scheduleSeen[schedule]; !ok {
+				scheduleSeen[schedule] = struct{}{}
+				schedules = append(schedules, schedule)
+			}
+		}
+		sort.Slice(schedules, func(i, j int) bool {
+			if schedules[i].Start == schedules[j].Start {
+				return schedules[i].End < schedules[j].End
+			}
+			return schedules[i].Start < schedules[j].Start
+		})
+		sites = append(sites, Site{Domain: domain, Enabled: site.Enabled, Schedules: schedules})
 	}
-	sort.Strings(domains)
-	c.Domains = domains
+	sort.Slice(sites, func(i, j int) bool { return sites[i].Domain < sites[j].Domain })
+	c.Sites = sites
 	return c, nil
 }
 
@@ -86,20 +102,79 @@ func NormalizeDomain(raw string) (string, error) {
 	return domain, nil
 }
 
-func (c Config) ActiveAt(now time.Time) bool {
-	if !c.Enabled || len(c.Domains) == 0 {
-		return false
-	}
-	start, err1 := parseClock(c.Start)
-	end, err2 := parseClock(c.End)
-	if err1 != nil || err2 != nil || start == end {
-		return false
-	}
+func (c Config) ActiveDomainsAt(now time.Time) []string {
 	minute := now.Hour()*60 + now.Minute()
+	var domains []string
+	for _, site := range c.Sites {
+		if !site.Enabled {
+			continue
+		}
+		if len(site.Schedules) == 0 {
+			domains = append(domains, site.Domain)
+			continue
+		}
+		for _, schedule := range site.Schedules {
+			start, err1 := parseClock(schedule.Start)
+			end, err2 := parseClock(schedule.End)
+			if err1 == nil && err2 == nil && start != end && minuteInRange(minute, start, end) {
+				domains = append(domains, site.Domain)
+				break
+			}
+		}
+	}
+	return domains
+}
+
+func (c Config) ActiveAt(now time.Time) bool {
+	return len(c.ActiveDomainsAt(now)) > 0
+}
+
+func minuteInRange(minute, start, end int) bool {
 	if start < end {
 		return minute >= start && minute < end
 	}
 	return minute >= start || minute < end
+}
+
+// IsAtLeastAsStrictAs reports whether c blocks every domain at every minute
+// that previous blocks. New domains and additional blocked time are stricter.
+func (c Config) IsAtLeastAsStrictAs(previous Config) bool {
+	current := blockedMinutes(c)
+	before := blockedMinutes(previous)
+	for domain, minutes := range before {
+		for minute, blocked := range minutes {
+			if blocked && !current[domain][minute] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func blockedMinutes(c Config) map[string][1440]bool {
+	result := make(map[string][1440]bool, len(c.Sites))
+	for _, site := range c.Sites {
+		var minutes [1440]bool
+		if site.Enabled {
+			if len(site.Schedules) == 0 {
+				for minute := range minutes {
+					minutes[minute] = true
+				}
+			}
+			for _, schedule := range site.Schedules {
+				start, err1 := parseClock(schedule.Start)
+				end, err2 := parseClock(schedule.End)
+				if err1 != nil || err2 != nil || start == end {
+					continue
+				}
+				for minute := 0; minute < len(minutes); minute++ {
+					minutes[minute] = minutes[minute] || minuteInRange(minute, start, end)
+				}
+			}
+		}
+		result[site.Domain] = minutes
+	}
+	return result
 }
 
 func parseClock(value string) (int, error) {
@@ -110,68 +185,24 @@ func parseClock(value string) (int, error) {
 	return parsed.Hour()*60 + parsed.Minute(), nil
 }
 
-func Load(path string) (Config, error) {
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return Default(), nil
-	}
-	if err != nil {
-		return Config{}, err
-	}
-	var c Config
-	if err := json.Unmarshal(data, &c); err != nil {
-		return Config{}, fmt.Errorf("decode config: %w", err)
-	}
-	return c.Validate()
-}
-
-func Save(path string, c Config) error {
-	validated, err := c.Validate()
-	if err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(validated, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	temp, err := os.CreateTemp(filepath.Dir(path), ".config-*")
-	if err != nil {
-		return err
-	}
-	tempName := temp.Name()
-	defer os.Remove(tempName)
-	if err := temp.Chmod(0600); err != nil {
-		temp.Close()
-		return err
-	}
-	if _, err := temp.Write(data); err != nil {
-		temp.Close()
-		return err
-	}
-	if err := temp.Sync(); err != nil {
-		temp.Close()
-		return err
-	}
-	if err := temp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tempName, path)
-}
-
 func ParseDomains(text string) ([]string, error) {
 	parts := strings.FieldsFunc(text, func(r rune) bool {
 		return r == '\n' || r == '\r' || r == ','
 	})
-	c := Config{Start: "00:00", End: "00:01", Domains: parts}
-	validated, err := c.Validate()
-	if err != nil {
-		return nil, err
+	domains := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		domain, err := NormalizeDomain(part)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[domain]; !ok {
+			seen[domain] = struct{}{}
+			domains = append(domains, domain)
+		}
 	}
-	return validated.Domains, nil
+	sort.Strings(domains)
+	return domains, nil
 }
 
 func IsLoopbackURL(raw string, port int) bool {

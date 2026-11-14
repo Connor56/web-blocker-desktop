@@ -50,18 +50,29 @@ To replace an installed version with the current executable:
 
 The browser page configures:
 
-- Whether blocking is enabled
-- One start and end time, repeated every day
 - Exact domain names to block
+- Whether each domain is enabled
+- Any number of daily blocking windows for each domain
 
 Overnight windows are supported; for example, `22:00` to `06:00`. Start and end times cannot be identical.
+An enabled domain with no schedules is blocked permanently.
+Adding a domain or expanding its blocked times takes effect immediately. Disabling or
+deleting a domain or reducing its blocked minutes requires the 120-second moving-dot
+challenge. The dot must be clicked at least once every five seconds or the full timer
+restarts. Removing the final schedule instead makes the block permanent and is a tightening
+change. This is enforced by the local service API, not only by the browser page.
 
 ## Windows build and installation
 
-From PowerShell, build and run:
+From PowerShell, build:
 
 ```powershell
 go build -trimpath -o annoying-web-blocker-desktop.exe ./cmd/annoying-web-blocker-desktop
+```
+
+Then run with:
+
+```powershell
 .\annoying-web-blocker-desktop.exe
 ```
 
@@ -90,7 +101,24 @@ A malformed configuration does not prevent the settings page from opening. It sh
 
 Settings saves and scheduled reconciliation share one lock, so overlapping saves cannot apply an older schedule after a newer one. The page checks enforcement status every five seconds; DNS-flush failures are reported and retried. Schedule changes and resume from sleep are reconciled at the next 30-second check. Blocking uses local clock time, so manually changing the system clock or timezone changes the active window.
 
-The UI permits disabling blocking at any time. This is a personal reminder/blocker rather than a locked commitment mode. Hosts entries do not close existing network connections or cover unlisted subdomains.
+The challenge is deliberate friction rather than tamper-proof security: an administrator
+can still stop the service or edit its files. Hosts entries do not close existing network
+connections or cover unlisted subdomains.
+
+## Schedule storage
+
+The schedule is serialized as JSON internally, then authenticated and encrypted
+with AES-256-GCM in `config.bin`. Its random machine key is stored separately in
+`config.bin.key`: Windows protects it with machine-scope DPAPI and an
+Administrators/SYSTEM-only ACL; macOS stores it as a root-only `0600` file.
+`config.bin.bak` retains the previous authenticated configuration.
+
+Each site has an exact `domain`, an `enabled` flag, and a `schedules` array of
+`start`/`end` times in local 24-hour `HH:MM` format. Existing `config.json` files
+are encrypted and removed during installation. If the primary file is corrupt,
+the authenticated backup is used. If protected storage becomes unavailable
+while running, the daemon continues reconciling the last valid in-memory
+schedule rather than treating it as an empty configuration.
 
 ## Domain limitations
 

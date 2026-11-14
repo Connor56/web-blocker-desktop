@@ -87,12 +87,8 @@ func InstallRoot(source, userHome string, uid, gid int) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(config.DefaultPath); errors.Is(err, os.ErrNotExist) {
-		if err := config.Save(config.DefaultPath, config.Default()); err != nil {
-			return fmt.Errorf("create default config: %w", err)
-		}
-	} else if err != nil {
-		return err
+	if err := config.Initialize(config.DefaultPath); err != nil {
+		return fmt.Errorf("initialize configuration: %w", err)
 	}
 	if err := writeClientToken(userHome, token, uid, gid); err != nil {
 		return err

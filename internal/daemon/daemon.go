@@ -41,11 +41,13 @@ func run(ctx context.Context, options Options, interval time.Duration, address s
 	manager := hosts.NewManager(options.HostsPath)
 	var coordinator sync.Mutex
 	var status web.Status
+	var lastValid *config.Config
 	pendingDNS := true
 	reconcileConfig := func(c config.Config) error {
 		now := time.Now()
-		active := c.ActiveAt(now)
-		changed, err := manager.Reconcile(active, c.Domains)
+		domains := c.ActiveDomainsAt(now)
+		active := len(domains) > 0
+		changed, err := manager.Reconcile(active, domains)
 		status.Checked = now
 		status.Active = false
 		status.Error = ""
@@ -71,8 +73,16 @@ func run(ctx context.Context, options Options, interval time.Duration, address s
 		if err != nil {
 			status.Error = err.Error()
 			status.Checked = time.Now()
+			if lastValid != nil {
+				enforceErr := reconcileConfig(*lastValid)
+				status.Error = "Protected configuration could not be read; continuing with the last valid schedule: " + err.Error()
+				if enforceErr != nil {
+					status.Error += "; enforcement error: " + enforceErr.Error()
+				}
+			}
 			return err
 		}
+		lastValid = &c
 		return reconcileConfig(c)
 	}
 	if err := reconcile(); err != nil {
@@ -80,14 +90,16 @@ func run(ctx context.Context, options Options, interval time.Duration, address s
 	}
 
 	handler := web.Handler{
-		Token:      token,
-		ConfigPath: options.ConfigPath,
+		Token:                    token,
+		ConfigPath:               options.ConfigPath,
+		ProtectedStorageRequired: true,
 		Save: func(c config.Config) error {
 			coordinator.Lock()
 			defer coordinator.Unlock()
 			if err := config.Save(options.ConfigPath, c); err != nil {
 				return err
 			}
+			lastValid = &c
 			if err := reconcileConfig(c); err != nil {
 				return fmt.Errorf("saved, but could not update hosts: %w", err)
 			}

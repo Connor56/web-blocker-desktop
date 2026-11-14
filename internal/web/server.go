@@ -1,8 +1,10 @@
 package web
 
 import (
+	"crypto/rand"
 	"crypto/subtle"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"io/fs"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"annoying-web-blocker-desktop/internal/config"
@@ -25,12 +28,15 @@ const (
 var assets embed.FS
 
 type Handler struct {
-	Token      string
-	ConfigPath string
-	Now        func() time.Time
-	OnChange   func(config.Config) error
-	Save       func(config.Config) error
-	Status     func() Status
+	Token                    string
+	ConfigPath               string
+	Now                      func() time.Time
+	OnChange                 func(config.Config) error
+	Save                     func(config.Config) error
+	Status                   func() Status
+	ChallengeDuration        time.Duration
+	ClickInterval            time.Duration
+	ProtectedStorageRequired bool
 }
 
 type Status struct {
@@ -46,11 +52,29 @@ type response struct {
 	Active bool          `json:"active"`
 }
 
+type challengeState struct {
+	mu          sync.Mutex
+	id          string
+	started     time.Time
+	lastClick   time.Time
+	unlockToken string
+	unlockUntil time.Time
+}
+
 func (h Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
+	challenge := &challengeState{}
 	static, _ := fs.Sub(assets, "static")
 	mux.Handle("/", http.FileServer(http.FS(static)))
-	mux.HandleFunc("/api/config", h.handleConfig)
+	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		h.handleConfig(w, r, challenge)
+	})
+	mux.HandleFunc("/api/unlock/start", func(w http.ResponseWriter, r *http.Request) {
+		h.handleUnlockStart(w, r, challenge)
+	})
+	mux.HandleFunc("/api/unlock/click", func(w http.ResponseWriter, r *http.Request) {
+		h.handleUnlockClick(w, r, challenge)
+	})
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		if !h.authorized(r) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -78,7 +102,7 @@ func (h Handler) Routes() http.Handler {
 	})
 }
 
-func (h Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
+func (h Handler) handleConfig(w http.ResponseWriter, r *http.Request, challenge *challengeState) {
 	if !h.authorized(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -96,7 +120,7 @@ func (h Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "content type must be application/json", http.StatusUnsupportedMediaType)
 			return
 		}
-		h.putConfig(w, r)
+		h.putConfig(w, r, challenge)
 	default:
 		w.Header().Set("Allow", "GET, PUT")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -110,7 +134,7 @@ func (h Handler) getConfig(w http.ResponseWriter) {
 	}
 	var configError string
 	if err != nil {
-		configError = "Configuration could not be read; enter settings and save to repair it: " + err.Error()
+		configError = "Protected configuration could not be read. The service will keep its last valid enforcement state: " + err.Error()
 	}
 	now := time.Now()
 	if h.Now != nil {
@@ -124,7 +148,7 @@ func (h Handler) getConfig(w http.ResponseWriter) {
 	writeJSON(w, result, http.StatusOK)
 }
 
-func (h Handler) putConfig(w http.ResponseWriter, r *http.Request) {
+func (h Handler) putConfig(w http.ResponseWriter, r *http.Request, challenge *challengeState) {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
 	decoder.DisallowUnknownFields()
 	var c config.Config
@@ -140,6 +164,20 @@ func (h Handler) putConfig(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
+	}
+	current, loadErr := config.Load(h.ConfigPath)
+	if loadErr != nil && (h.ProtectedStorageRequired || config.StoragePresent(h.ConfigPath)) {
+		writeError(w, fmt.Errorf("refusing to replace unavailable protected configuration: %w", loadErr), http.StatusInternalServerError)
+		return
+	}
+	if loadErr == nil && !validated.IsAtLeastAsStrictAs(current) {
+		if !challenge.consumeUnlock(r.Header.Get("X-Change-Unlock"), time.Now()) {
+			writeJSON(w, map[string]any{
+				"error":             "This change weakens blocking and requires the moving-dot challenge.",
+				"challengeRequired": true,
+			}, http.StatusLocked)
+			return
+		}
 	}
 	save := h.Save
 	if save == nil {
@@ -162,6 +200,109 @@ func (h Handler) putConfig(w http.ResponseWriter, r *http.Request) {
 		now = h.Now()
 	}
 	writeJSON(w, response{Config: validated, Active: validated.ActiveAt(now)}, http.StatusOK)
+}
+
+func (h Handler) challengeSettings() (time.Duration, time.Duration) {
+	duration := h.ChallengeDuration
+	if duration <= 0 {
+		duration = 120 * time.Second
+	}
+	interval := h.ClickInterval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	return duration, interval
+}
+
+func (h Handler) handleUnlockStart(w http.ResponseWriter, r *http.Request, state *challengeState) {
+	if !h.authorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if r.Header.Get("Origin") != BaseURL {
+		http.Error(w, "invalid origin", http.StatusForbidden)
+		return
+	}
+	duration, interval := h.challengeSettings()
+	now := time.Now()
+	state.mu.Lock()
+	state.id = randomToken()
+	state.started = now
+	state.lastClick = now
+	state.unlockToken = ""
+	id := state.id
+	state.mu.Unlock()
+	writeJSON(w, map[string]any{
+		"id": id, "remainingMs": duration.Milliseconds(), "clickWithinMs": interval.Milliseconds(),
+	}, http.StatusOK)
+}
+
+func (h Handler) handleUnlockClick(w http.ResponseWriter, r *http.Request, state *challengeState) {
+	if !h.authorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if r.Header.Get("Origin") != BaseURL {
+		http.Error(w, "invalid origin", http.StatusForbidden)
+		return
+	}
+	var request struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&request); err != nil {
+		writeError(w, errors.New("invalid challenge request"), http.StatusBadRequest)
+		return
+	}
+	duration, interval := h.challengeSettings()
+	now := time.Now()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if request.ID == "" || subtle.ConstantTimeCompare([]byte(request.ID), []byte(state.id)) != 1 {
+		writeError(w, errors.New("challenge is no longer active"), http.StatusConflict)
+		return
+	}
+	if now.Sub(state.lastClick) > interval {
+		state.id = ""
+		writeError(w, errors.New("you did not click in time; restart the challenge"), http.StatusConflict)
+		return
+	}
+	state.lastClick = now
+	remaining := duration - now.Sub(state.started)
+	if remaining > 0 {
+		writeJSON(w, map[string]any{"remainingMs": remaining.Milliseconds(), "clickWithinMs": interval.Milliseconds()}, http.StatusOK)
+		return
+	}
+	state.unlockToken = randomToken()
+	state.unlockUntil = now.Add(time.Minute)
+	state.id = ""
+	writeJSON(w, map[string]any{"remainingMs": 0, "unlockToken": state.unlockToken}, http.StatusOK)
+}
+
+func (s *challengeState) consumeUnlock(token string, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if token == "" || now.After(s.unlockUntil) ||
+		subtle.ConstantTimeCompare([]byte(token), []byte(s.unlockToken)) != 1 {
+		return false
+	}
+	s.unlockToken = ""
+	return true
+}
+
+func randomToken() string {
+	value := make([]byte, 24)
+	if _, err := rand.Read(value); err != nil {
+		panic(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(value)
 }
 
 func (h Handler) authorized(r *http.Request) bool {

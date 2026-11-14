@@ -4,7 +4,6 @@ import (
 	"annoying-web-blocker-desktop/internal/config"
 	"annoying-web-blocker-desktop/internal/web"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -78,7 +77,12 @@ func TestConcurrentSavesRemainOrdered(t *testing.T) {
 	eventually(t, func() bool { return request("GET", "") == nil })
 	now := time.Now()
 	body := func(domain string) string {
-		return fmt.Sprintf(`{"enabled":true,"start":%q,"end":%q,"domains":[%q]}`, now.Add(-time.Hour).Format("15:04"), now.Add(time.Hour).Format("15:04"), domain)
+		if domain == "second.example" {
+			return fmt.Sprintf(`{"sites":[{"domain":"first.example","enabled":true,"schedules":[{"start":%q,"end":%q}]},{"domain":"second.example","enabled":true,"schedules":[{"start":%q,"end":%q}]}]}`,
+				now.Add(-time.Hour).Format("15:04"), now.Add(time.Hour).Format("15:04"),
+				now.Add(-time.Hour).Format("15:04"), now.Add(time.Hour).Format("15:04"))
+		}
+		return fmt.Sprintf(`{"sites":[{"domain":%q,"enabled":true,"schedules":[{"start":%q,"end":%q}]}]}`, domain, now.Add(-time.Hour).Format("15:04"), now.Add(time.Hour).Format("15:04"))
 	}
 	first := make(chan error, 1)
 	go func() { first <- request("PUT", body("first.example")) }()
@@ -97,7 +101,7 @@ func TestConcurrentSavesRemainOrdered(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 	c, err := config.Load(options.ConfigPath)
-	if err != nil || len(c.Domains) != 1 || c.Domains[0] != "first.example" {
+	if err != nil || len(c.Sites) != 1 || c.Sites[0].Domain != "first.example" {
 		t.Fatalf("settings changed during first save: %+v, %v", c, err)
 	}
 	unblock()
@@ -108,11 +112,11 @@ func TestConcurrentSavesRemainOrdered(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err = config.Load(options.ConfigPath)
-	if err != nil || len(c.Domains) != 1 || c.Domains[0] != "second.example" {
+	if err != nil || len(c.Sites) != 2 || c.Sites[1].Domain != "second.example" {
 		t.Fatalf("unexpected final settings: %+v, %v", c, err)
 	}
 	data, err := os.ReadFile(options.HostsPath)
-	if err != nil || !strings.Contains(string(data), "second.example") || strings.Contains(string(data), "first.example") {
+	if err != nil || !strings.Contains(string(data), "second.example") || !strings.Contains(string(data), "first.example") {
 		t.Fatalf("hosts do not match latest settings: %s, %v", data, err)
 	}
 }
@@ -125,6 +129,9 @@ func fixture(t *testing.T) Options {
 		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := config.Initialize(options.ConfigPath); err != nil {
+		t.Fatal(err)
 	}
 	return options
 }
@@ -167,7 +174,7 @@ func TestBusyUIPortDoesNotStopEnforcement(t *testing.T) {
 	// Saving after startup exercises the periodic loop, rather than just the initial write.
 	time.Sleep(50 * time.Millisecond)
 	now := time.Now()
-	c := config.Config{Enabled: true, Start: now.Add(-time.Hour).Format("15:04"), End: now.Add(time.Hour).Format("15:04"), Domains: []string{"example.com"}}
+	c := config.Config{Sites: []config.Site{{Domain: "example.com", Enabled: true, Schedules: []config.Schedule{{Start: now.Add(-time.Hour).Format("15:04"), End: now.Add(time.Hour).Format("15:04")}}}}}
 	if err := config.Save(options.ConfigPath, c); err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +183,7 @@ func TestBusyUIPortDoesNotStopEnforcement(t *testing.T) {
 		return strings.Contains(string(data), "127.0.0.1 example.com")
 	})
 }
-func TestMalformedConfigCanBeRepairedThroughUI(t *testing.T) {
+func TestMalformedProtectedConfigCannotBeReplacedThroughUI(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -205,19 +212,11 @@ func TestMalformedConfigCanBeRepairedThroughUI(t *testing.T) {
 	}
 	eventually(t, func() bool {
 		code, data := request("GET", "/api/config", "")
-		return code == 200 && strings.Contains(string(data), "save to repair")
+		return code == 200 && strings.Contains(string(data), "Protected configuration could not be read")
 	})
 	now := time.Now()
-	body := fmt.Sprintf(`{"enabled":true,"start":%q,"end":%q,"domains":["example.com"]}`, now.Add(-time.Hour).Format("15:04"), now.Add(time.Hour).Format("15:04"))
-	if code, data := request("PUT", "/api/config", body); code != 200 {
-		t.Fatalf("save: %d %s", code, data)
-	}
-	code, data := request("GET", "/api/status", "")
-	var status web.Status
-	if err := json.Unmarshal(data, &status); err != nil {
-		t.Fatal(err)
-	}
-	if code != 200 || !status.Active || status.Error != "" {
-		t.Fatalf("status: %d %s", code, data)
+	body := fmt.Sprintf(`{"sites":[{"domain":"example.com","enabled":true,"schedules":[{"start":%q,"end":%q}]}]}`, now.Add(-time.Hour).Format("15:04"), now.Add(time.Hour).Format("15:04"))
+	if code, data := request("PUT", "/api/config", body); code != http.StatusInternalServerError {
+		t.Fatalf("protected configuration was replaced: %d %s", code, data)
 	}
 }
