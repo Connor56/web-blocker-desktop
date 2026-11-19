@@ -29,12 +29,19 @@ Use `arm64` for Apple silicon and `amd64` for Intel Macs.
 
 ## Install and use
 
-Make the downloaded or built file executable, then run it:
+Make the downloaded or built file executable:
 
 ```sh
 chmod +x ./annoying-web-blocker-desktop
+```
+
+Then run it:
+
+```sh
 ./annoying-web-blocker-desktop
 ```
+
+You may get a permissions issue, if you do, you need to move repo's folder to a location in `~/`, for example: `~/projects/web-blocker-desktop`.
 
 On macOS, the first run displays the normal administrator dialog, installs and starts the daemon, and opens the settings page in the default browser. Later runs simply open the settings page:
 
